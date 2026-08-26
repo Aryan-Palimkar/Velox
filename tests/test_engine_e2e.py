@@ -401,3 +401,68 @@ def test_int8_kv_cache_beats_fp8_at_the_same_size(tokenizer):
 
     assert int8_agreement > fp8_agreement
     assert int8_cosine > fp8_cosine
+
+
+def test_long_context_prefill_matches_huggingface(tokenizer):
+    from transformers import AutoModelForCausalLM
+
+    _release_shared()
+    paragraph = (
+        "Coral reefs occupy a tiny fraction of the ocean floor yet shelter a "
+        "quarter of all marine species. Reef-building corals depend on symbiotic "
+        "algae for most of their energy, and expel them when the water warms. "
+    )
+    text = paragraph * 12
+    token_ids = tokenizer.encode(text)
+    assert len(token_ids) > 512, f"probe is only {len(token_ids)} tokens"
+
+    engine = _build_engine(
+        max_num_batched_tokens=2048,
+        max_prefill_chunk_size=2048,
+        num_gpu_blocks=512,
+        enable_prefix_caching=False,
+    )
+    try:
+        actual = _velox_prefill_logits(engine, token_ids).cpu()
+    finally:
+        _free_engine(engine)
+
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, torch_dtype=torch.bfloat16
+    ).eval()
+    with torch.no_grad():
+        expected = reference_model(torch.tensor([token_ids])).logits[0].float()
+    del reference_model
+    gc.collect()
+
+    agreement = (actual.argmax(-1) == expected.argmax(-1)).float().mean().item()
+    assert agreement >= 0.95, f"argmax agreed on only {agreement:.1%} of {len(token_ids)} positions"
+    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=-1)
+    assert cosine.min().item() >= 0.98, f"worst-position cosine {cosine.min():.4f}"
+
+
+def test_long_context_decode_is_stable(tokenizer):
+    _release_shared()
+    text = (
+        "The following is a technical note about ocean currents. " * 70
+        + "\n\nSummarise the note in one sentence:"
+    )
+    engine = _build_engine(
+        max_num_batched_tokens=2048,
+        max_prefill_chunk_size=256,
+        num_gpu_blocks=512,
+        enable_prefix_caching=False,
+    )
+    try:
+        token_ids = tokenizer.encode(text)
+        assert len(token_ids) > 512
+        request = Request(
+            "long", token_ids, SamplingParams(temperature=0.0, max_tokens=32)
+        )
+        engine.generate([request])
+        assert len(request.output_token_ids) > 0
+        decoded = tokenizer.decode(request.output_token_ids, skip_special_tokens=True)
+        assert decoded.strip(), "long-context generation produced no text"
+        assert len(set(request.output_token_ids)) > 3, f"degenerate output: {decoded!r}"
+    finally:
+        _free_engine(engine)

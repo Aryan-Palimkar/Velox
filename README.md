@@ -99,6 +99,18 @@ Measured, not assumed: teacher-forced logits over a 50-token prompt, compared po
 
 FP8 is fine for *weights*, where the error averages out over a 1536-deep dot product and the model is far less sensitive.
 
+### What it all adds up to
+
+Running `--quantization int8 --kv-cache-dtype int8` on the same 6 GB card:
+
+| | Original | Velox |
+| :--- | ---: | ---: |
+| KV cache capacity | 16,384 tokens | **163,472 tokens** |
+| Shape of that capacity | 8 fixed slots of 2048 | any mix of lengths |
+| Decode step (batch 16) | — | 10.8 ms |
+
+**10× the KV capacity**, and it can be spent on 100 short conversations or a handful of long ones rather than 8 worst-case slots.
+
 ## A debugging rabbit hole
 
 The most interesting bug in this rewrite was not in a kernel. It was a single line of staging code.
@@ -202,13 +214,14 @@ pytest -m "not slow"        # unit tests only, ~12 s
 pytest -m gpu               # anything needing CUDA
 ```
 
-The suite is 152 tests. The ones that matter most:
+The suite is 160 tests. The ones that matter most:
 
 - **Kernel equivalence** (`test_paged_attention.py`) — paged prefill and decode against `F.scaled_dot_product_attention`, over deliberately fragmented block tables so a kernel that assumed contiguity fails rather than accidentally passes. Covers chunked prefill, cached prefixes, split-K, and both quantized KV dtypes.
 - **Teacher-forced logits** (`test_engine_e2e.py`) — a whole sequence compared against HuggingFace in one pass, so every position is checked independently instead of only the first divergence.
 - **Batched vs solo** — the same prompts run together and alone must produce identical tokens.
 - **Reference counting** (`test_radix_cache.py`, `test_block_allocator.py`) — eviction never frees a live block, and churn never leaks one. Every scheduler test ends by asserting allocator and tree invariants.
 - **Streaming** (`test_server_streaming.py`) — a real uvicorn process driven by the `openai` client: chunk framing, the `[DONE]` sentinel, usage placement, concurrent streams, and an assertion that the first frame arrives well before the last, which is what distinguishes streaming from buffering.
+- **Long context** — ~900 tokens through a chunked prefill, so block-table traversal past the first few pages and the seam between chunks are checked at every position rather than only near the start.
 
 Feature-flag tests (CUDA graphs, chunked prefill, preemption, prefix caching) assert that turning a feature on does not change what the model produces. Where two paths reduce in a different order — split-K versus a single pass — they are compared on argmax and cosine similarity rather than on a chained greedy continuation, because bf16 rounding can legitimately flip a near-tie and send two correct implementations to different sentences.
 

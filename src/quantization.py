@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 FP8_E4M3_MAX = 448.0
 FP8_E5M2_MAX = 57344.0
@@ -56,6 +59,16 @@ def resolve_kv_cache_dtype(kv_cache_dtype: str, model_dtype: torch.dtype) -> Tup
     if target in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_supported():
         raise RuntimeError(
             f"kv_cache_dtype={kv_cache_dtype!r} requires compute capability 8.9 or newer"
+        )
+    if target is torch.float8_e4m3fn:
+        logger.warning(
+            "kv_cache_dtype=fp8 costs noticeably more accuracy than int8 at the "
+            "same size; prefer int8 unless you specifically need FP8 storage"
+        )
+    elif target is torch.float8_e5m2:
+        logger.warning(
+            "kv_cache_dtype=fp8_e5m2 keeps only 2 mantissa bits and degrades "
+            "output quality substantially; it is provided for completeness"
         )
     return target, True
 

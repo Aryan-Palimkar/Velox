@@ -18,7 +18,7 @@ Everything below runs on a single 6 GB laptop GPU.
 
 **Continuous batching with recompute preemption.** Decode work has priority, then in-flight prefill chunks, then new admissions. When the pool cannot cover the next step, the *newest* running request is preempted and rewound; preempting from the back is what keeps the policy starvation-free. A preempted request recomputes its generated tokens as well as its prompt, and often recovers most of them straight from the prefix cache.
 
-**Quantization.** FP8 (e4m3/e5m2) or INT8 KV cache with per-token, per-head scales, dequantized inside the attention kernel — the K scale folds in after the score dot, the V scale folds into the softmax weights. Weight-only INT8/FP8 for every projection GEMM, with a Triton kernel that widens the weight tile in SRAM.
+**Quantization.** INT8 or FP8 KV cache with per-token, per-head scales, dequantized inside the attention kernel — the K scale folds in after the score dot, the V scale folds into the softmax weights, so neither costs an extra pass. Weight-only INT8/FP8 for every projection GEMM, with a Triton kernel that widens the weight tile in SRAM. INT8 is the right choice for the KV cache and the numbers below say why.
 
 **Streaming OpenAI API.** Server-sent events with correct chunk framing, incremental detokenization that never splits a multi-byte character, stop strings matched across chunk boundaries, and usage on the final chunk.
 
@@ -82,6 +82,22 @@ TTFT is again measured under load: with `max_num_seqs=1` the 128th request waits
 | Mean TTFT | 0.162 s | 0.176 s |
 
 Decode on this GPU is bandwidth-bound: 1.5 B bf16 parameters is 3.1 GB, and the card has ~192 GB/s, so a decode step cannot beat ~16 ms no matter how good the kernels are. Halving the weight width halves that floor, which is exactly what the 1.81× shows. Prefill is compute-bound instead, and the Triton dequant-GEMM lands within 8% of cuBLAS there.
+
+### What quantization costs
+
+Measured, not assumed: teacher-forced logits over a 50-token prompt, compared position-by-position against bf16.
+
+| Mode | Bytes/element | argmax agreement | mean cosine |
+| :--- | ---: | ---: | ---: |
+| INT8 weights | 1 | 94% | 0.999 |
+| FP8 weights | 1 | 96% | 0.998 |
+| **INT8 KV cache** | 1 | **94%** | **0.998** |
+| FP8 (e4m3) KV cache | 1 | 72% | 0.892 |
+| FP8 (e5m2) KV cache | 1 | 46% | 0.871 |
+
+**Use `--kv-cache-dtype int8`, not `fp8`.** Both cost one byte per element, but e4m3 keeps only three mantissa bits, and because relative precision in a float format is independent of scale, no amount of finer-grained scaling buys it back. INT8 with a per-token, per-head scale spends its whole range on the values that actually dominate an attention score. The kernel's FP8 conversion was checked against PyTorch's round-to-nearest — 18 tie differences in 4096 elements and an identical mean error — so this is the format's precision, not a rounding bug. `tests/test_engine_e2e.py` asserts the ordering so the recommendation cannot silently rot.
+
+FP8 is fine for *weights*, where the error averages out over a 1536-deep dot product and the model is far less sensitive.
 
 ## A debugging rabbit hole
 
@@ -171,7 +187,7 @@ print(request.output_token_ids)
 | `--block-size` | 16 | KV page size, in tokens. Must be a power of two. |
 | `--num-gpu-blocks` | auto | Overrides the memory-derived pool size. |
 | `--gpu-memory-utilization` | 0.90 | Fraction of *free* memory given to the KV cache. |
-| `--kv-cache-dtype` | `auto` | `fp8`, `fp8_e5m2`, or `int8`. FP8 needs compute capability 8.9+. |
+| `--kv-cache-dtype` | `auto` | `int8` (recommended), `fp8`, or `fp8_e5m2`. FP8 needs compute capability 8.9+ and is measurably lossier — see above. |
 | `--quantization` | none | `int8` or `fp8` weight-only quantization. |
 | `--no-prefix-caching` | off | Disables the radix cache. |
 | `--no-cuda-graphs` | off | Falls back to eager decode. |

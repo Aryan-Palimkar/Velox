@@ -339,3 +339,65 @@ def test_max_tokens_is_respected(engine, tokenizer):
 
 def test_shared_engine_teardown():
     _release_shared()
+
+
+_PROBE_TEXT = (
+    "The ocean covers most of the planet. Marine biologists study its ecosystems, "
+    "from coral reefs to the deep abyssal plains, where pressure and darkness shape "
+    "unusual forms of life. Seventeen times three is fifty-one."
+)
+
+
+def _probe_logits(tokenizer, **engine_overrides):
+    _release_shared()
+    engine = _build_engine(num_gpu_blocks=512, **engine_overrides)
+    try:
+        token_ids = tokenizer.encode(_PROBE_TEXT)
+        return _velox_prefill_logits(engine, token_ids).cpu()
+    finally:
+        _free_engine(engine)
+
+
+def _agreement(actual, expected):
+    match = (actual.argmax(-1) == expected.argmax(-1)).float().mean().item()
+    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=-1)
+    return match, cosine.mean().item()
+
+
+@pytest.mark.parametrize(
+    "overrides,min_agreement,min_cosine",
+    [
+        (dict(kv_cache_dtype="int8"), 0.85, 0.99),
+        (dict(quantization="int8"), 0.85, 0.99),
+        (dict(quantization="fp8"), 0.85, 0.99),
+        (dict(kv_cache_dtype="fp8"), 0.55, 0.85),
+    ],
+    ids=["kv-int8", "weights-int8", "weights-fp8", "kv-fp8"],
+)
+def test_quantized_configurations_track_bf16(tokenizer, overrides, min_agreement, min_cosine):
+    from src.quantization import fp8_supported
+
+    if "fp8" in "".join(str(value) for value in overrides.values()) and not fp8_supported():
+        pytest.skip("fp8 requires compute capability 8.9 or newer")
+
+    baseline = _probe_logits(tokenizer)
+    actual = _probe_logits(tokenizer, **overrides)
+
+    assert torch.isfinite(actual).all()
+    agreement, cosine = _agreement(actual, baseline)
+    assert agreement >= min_agreement, f"argmax agreement {agreement:.1%} for {overrides}"
+    assert cosine >= min_cosine, f"mean cosine {cosine:.4f} for {overrides}"
+
+
+def test_int8_kv_cache_beats_fp8_at_the_same_size(tokenizer):
+    from src.quantization import fp8_supported
+
+    if not fp8_supported():
+        pytest.skip("fp8 requires compute capability 8.9 or newer")
+
+    baseline = _probe_logits(tokenizer)
+    int8_agreement, int8_cosine = _agreement(_probe_logits(tokenizer, kv_cache_dtype="int8"), baseline)
+    fp8_agreement, fp8_cosine = _agreement(_probe_logits(tokenizer, kv_cache_dtype="fp8"), baseline)
+
+    assert int8_agreement > fp8_agreement
+    assert int8_cosine > fp8_cosine

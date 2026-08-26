@@ -1,89 +1,77 @@
+from __future__ import annotations
+
 import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
-def _rope_decode_kernel(
+def _rope_inplace_kernel(
     q_ptr, k_ptr,
     cos_ptr, sin_ptr,
     positions_ptr,
 
-    stride_qb, stride_qh, stride_qd,
-    stride_kb, stride_kh, stride_kd,
-    stride_cb, stride_cd,
+    stride_qt, stride_qh, stride_qd,
+    stride_kt, stride_kh, stride_kd,
+    stride_ct, stride_cd,
 
-    B, H_Q, H_K,
-    D: tl.constexpr,
+    H_Q: tl.constexpr,
+    H_K: tl.constexpr,
     HALF_D: tl.constexpr,
 ):
-    batch_idx = tl.program_id(0)
+    token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    is_q = head_idx < H_Q
-    is_k = head_idx < H_K
+    pos = tl.load(positions_ptr + token_idx).to(tl.int32)
 
-    if not is_q and not is_k:
-        return
+    offs = tl.arange(0, HALF_D)
+    cos = tl.load(cos_ptr + pos * stride_ct + offs * stride_cd).to(tl.float32)
+    sin = tl.load(sin_ptr + pos * stride_ct + offs * stride_cd).to(tl.float32)
 
-    pos = tl.load(positions_ptr + batch_idx)
+    if head_idx < H_Q:
+        base = q_ptr + token_idx * stride_qt + head_idx * stride_qh
+        lo_ptr = base + offs * stride_qd
+        hi_ptr = base + (offs + HALF_D) * stride_qd
+        lo = tl.load(lo_ptr).to(tl.float32)
+        hi = tl.load(hi_ptr).to(tl.float32)
+        tl.store(lo_ptr, (lo * cos - hi * sin).to(q_ptr.dtype.element_ty))
+        tl.store(hi_ptr, (lo * sin + hi * cos).to(q_ptr.dtype.element_ty))
 
-    d_offsets = tl.arange(0, HALF_D)
-
-    first_half_offsets = d_offsets
-    second_half_offsets = d_offsets + HALF_D
-
-    cos_offset = pos * stride_cb + d_offsets * stride_cd
-    sin_offset = pos * stride_cb + d_offsets * stride_cd
-
-    cos = tl.load(cos_ptr + cos_offset)
-    sin = tl.load(sin_ptr + sin_offset)
-
-    if is_q:
-        q_base = q_ptr + batch_idx * stride_qb + head_idx * stride_qh
-
-        q1 = tl.load(q_base + first_half_offsets * stride_qd)
-        q2 = tl.load(q_base + second_half_offsets * stride_qd)
-
-        q_rot1 = q1 * cos - q2 * sin
-        q_rot2 = q1 * sin + q2 * cos
-
-        tl.store(q_base + first_half_offsets * stride_qd, q_rot1)
-        tl.store(q_base + second_half_offsets * stride_qd, q_rot2)
-
-    if is_k:
-        k_base = k_ptr + batch_idx * stride_kb + head_idx * stride_kh
-
-        k1 = tl.load(k_base + first_half_offsets * stride_kd)
-        k2 = tl.load(k_base + second_half_offsets * stride_kd)
-
-        k_rot1 = k1 * cos - k2 * sin
-        k_rot2 = k1 * sin + k2 * cos
-
-        tl.store(k_base + first_half_offsets * stride_kd, k_rot1)
-        tl.store(k_base + second_half_offsets * stride_kd, k_rot2)
+    if head_idx < H_K:
+        base = k_ptr + token_idx * stride_kt + head_idx * stride_kh
+        lo_ptr = base + offs * stride_kd
+        hi_ptr = base + (offs + HALF_D) * stride_kd
+        lo = tl.load(lo_ptr).to(tl.float32)
+        hi = tl.load(hi_ptr).to(tl.float32)
+        tl.store(lo_ptr, (lo * cos - hi * sin).to(k_ptr.dtype.element_ty))
+        tl.store(hi_ptr, (lo * sin + hi * cos).to(k_ptr.dtype.element_ty))
 
 
-def apply_rope_decode_inplace(
-    q: torch.Tensor,
-    k: torch.Tensor,
+def apply_rope_inplace(
+    query: torch.Tensor,
+    key: torch.Tensor,
     positions: torch.Tensor,
     cos: torch.Tensor,
-    sin: torch.Tensor
-):
-    B, H_Q, D = q.shape
-    _, H_K, _ = k.shape
+    sin: torch.Tensor,
+) -> None:
+    num_tokens, num_q_heads, head_dim = query.shape
+    num_kv_heads = key.shape[1]
+    if num_tokens == 0:
+        return
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
+    if cos.shape[1] != head_dim // 2:
+        raise ValueError(
+            f"cos table has width {cos.shape[1]} but head_dim // 2 is {head_dim // 2}"
+        )
 
-    grid = (B, max(H_Q, H_K))
-
-    _rope_decode_kernel[grid](
-        q, k, cos, sin, positions,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
+    _rope_inplace_kernel[(num_tokens, max(num_q_heads, num_kv_heads))](
+        query, key, cos, sin, positions,
+        query.stride(0), query.stride(1), query.stride(2),
+        key.stride(0), key.stride(1), key.stride(2),
         cos.stride(0), cos.stride(1),
-        B, H_Q, H_K,
-        D=D,
-        HALF_D=D // 2,
-        num_warps=2
+        H_Q=num_q_heads,
+        H_K=num_kv_heads,
+        HALF_D=head_dim // 2,
+        num_warps=2,
     )
-
-    return q, k

@@ -184,6 +184,7 @@ def compute_num_blocks(
         raise ValueError("compute_num_blocks requires a CUDA device")
 
     free_bytes, _ = torch.cuda.mem_get_info(device)
+    free_bytes += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     budget = int(free_bytes * gpu_memory_utilization) - reserve_bytes
     if budget <= 0:
         raise RuntimeError(

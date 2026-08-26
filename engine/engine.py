@@ -1,204 +1,460 @@
-from dataclasses import dataclass
-import torch
-from .schedulerv2 import Scheduler
-from src.transformer import QwenForCausalLM
-from engine.sampler import Sampler
-from engine.request import Request, RequestStatus
-from engine.utils import BatchMetadata
-import time
+from __future__ import annotations
 
-STOP_TOKENS = {151643, 151645}
+import logging
+import queue
+import time
+from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence
+
+import torch
+
+from src.block_manager import BlockSpaceManager
+from src.paged_kv_cache import PagedKVCache, compute_num_blocks
+from src.transformer import QwenForCausalLM
+
+from .config import EngineConfig
+from .model_runner import ModelRunner
+from .request import FinishReason, Request
+from .sampler import Sampler, TokenHistory
+from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .utils import SamplingParams
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EOS_TOKEN_IDS = frozenset({151643, 151645})
+
 
 class Engine:
-    def __init__(self, model: QwenForCausalLM, scheduler: Scheduler, device="cuda"):
-        self.model = model.to(device)
-        self.scheduler = scheduler
-        self.sampler = Sampler()
-        self.device = device
+    def __init__(
+        self,
+        model: QwenForCausalLM,
+        kv_cache: PagedKVCache,
+        config: EngineConfig,
+        eos_token_ids: Optional[Iterable[int]] = None,
+    ) -> None:
+        config.validate()
+        self.config = config
+        self.device = torch.device(config.device)
+        self.model = model
+        self.kv_cache = kv_cache
+        self.eos_token_ids: FrozenSet[int] = frozenset(
+            eos_token_ids if eos_token_ids is not None else DEFAULT_EOS_TOKEN_IDS
+        )
 
-        self.prefill_stream = torch.cuda.Stream(device=self.device)
-        self.decode_stream = torch.cuda.Stream(device=self.device)
+        self.block_manager = BlockSpaceManager(
+            kv_cache,
+            enable_prefix_caching=config.enable_prefix_caching,
+            max_model_len=config.max_model_len,
+        )
+        self.scheduler = Scheduler(
+            kv_cache=kv_cache,
+            config=SchedulerConfig(
+                max_num_seqs=config.max_num_seqs,
+                max_num_batched_tokens=config.max_num_batched_tokens,
+                max_prefill_chunk_size=config.max_prefill_chunk_size,
+                max_model_len=config.max_model_len,
+                enable_prefix_caching=config.enable_prefix_caching,
+            ),
+            block_manager=self.block_manager,
+        )
+        self.max_model_len = self.scheduler.config.max_model_len
 
-        self.stats = {
+        self.runner = ModelRunner(
+            model=model,
+            kv_cache=kv_cache,
+            block_manager=self.block_manager,
+            max_num_seqs=config.max_num_seqs,
+            max_num_batched_tokens=config.max_num_batched_tokens,
+            device=self.device,
+            enable_cuda_graphs=config.enable_cuda_graphs,
+        )
+        self.sampler = Sampler(device=self.device)
+        self.token_history = TokenHistory(
+            max_num_seqs=config.max_num_seqs,
+            max_model_len=self.max_model_len,
+            device=self.device,
+        )
+
+        self.scheduler.on_sequence_admitted = self._on_sequence_admitted
+        self.scheduler.on_sequence_released = self._on_sequence_released
+
+        if self.device.type == "cuda":
+            self.prefill_stream = torch.cuda.Stream(device=self.device)
+            self.decode_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.prefill_stream = None
+            self.decode_stream = None
+
+        self.stats: Dict[str, List[float]] = {
             "scheduler_ms": [],
+            "prepare_ms": [],
             "prefill_gpu_ms": [],
             "decode_gpu_ms": [],
             "cpu_sync_wait_ms": [],
-            "sampling_ms": []
+            "sampling_ms": [],
+            "step_ms": [],
         }
+        self.num_steps = 0
+        self._graphs_ready = False
 
-    def _prepare_inputs(self, batch: list['Request'], is_prefill: bool):
-        input_ids = []
-        positions = []
-        cu_seq_lens_q = [0]
-        cu_seq_lens_kv = [0]
-        cache_slots = []
-        seq_lens = []
-        prompt_lens = []
-        current_q_len = 0
-        current_kv_len = 0
+        self._pending_adds: "queue.Queue[Request]" = queue.Queue()
+        self._pending_aborts: "queue.Queue[str]" = queue.Queue()
 
-        for req in batch:
-            cache_slots.append(req.cache_slot)
+    @classmethod
+    def from_pretrained(
+        cls, config: Optional[EngineConfig] = None, **overrides
+    ) -> "Engine":
+        from src.config import ModelConfig
+        from src.weight_loader import load_qwen_weights
 
-            if is_prefill:
-                start_idx = req.num_computed_tokens
-                end_idx = start_idx + req.current_chunk_size
+        config = config or EngineConfig(**overrides)
+        config.validate()
 
-                tokens = req.prompt_token_ids[start_idx:end_idx]
-                seq_len = len(tokens)
-                pos = list(range(start_idx, end_idx))
+        device = torch.device(config.device)
+        dtype = config.torch_dtype()
+        if config.seed is not None:
+            torch.manual_seed(config.seed)
 
-                current_q_len += seq_len
-                current_kv_len += (start_idx + seq_len)
+        model_config = ModelConfig.from_hf(config.model, cache_dir=config.download_dir)
+        max_model_len = min(config.max_model_len, model_config.max_position_embeddings)
+        config.max_model_len = max_model_len
 
-                seq_lens.append(start_idx)
-                prompt_lens.append(seq_len)
+        logger.info("building %s on %s (%s)", config.model, device, dtype)
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            with torch.device(device):
+                model = QwenForCausalLM(model_config, max_position=max_model_len)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        load_qwen_weights(model, model_config, config.model, cache_dir=config.download_dir)
+        model.eval()
 
-                req.num_computed_tokens += seq_len
+        if config.quantization:
+            from .quantize import quantize_model
 
-                input_ids.extend(tokens)
-                positions.extend(pos)
+            quantize_model(model, config.quantization)
 
-            else:
-                tokens = [req.output_token_ids[-1] if req.output_token_ids else req.prompt_token_ids[-1]]
-                seq_len = 1
-                total_history_len = req.num_prompt_tokens + len(req.output_token_ids)
-                pos = [total_history_len - 1]
-
-                current_q_len += seq_len
-                current_kv_len += total_history_len
-
-                seq_lens.append(total_history_len)
-                prompt_lens.append(0)
-
-                input_ids.extend(tokens)
-                positions.extend(pos)
-
-            cu_seq_lens_q.append(current_q_len)
-            cu_seq_lens_kv.append(current_kv_len)
-
-        def to_gpu(lst, dtype=torch.int32):
-            return torch.tensor(lst, dtype=dtype).pin_memory().to(self.device, non_blocking=True)
-
-        metadata = BatchMetadata(
-            cu_seq_lens_q=to_gpu(cu_seq_lens_q),
-            cu_seq_lens_kv=to_gpu(cu_seq_lens_kv),
-            max_q_len=max((cu_seq_lens_q[i] - cu_seq_lens_q[i-1] for i in range(1, len(cu_seq_lens_q)))),
-            max_kv_len=max((cu_seq_lens_kv[i] - cu_seq_lens_kv[i-1] for i in range(1, len(cu_seq_lens_kv)))),
-            positions=to_gpu(positions, dtype=torch.long),
-            cache_slots=to_gpu(cache_slots, dtype=torch.long),
-            seq_lens=to_gpu(seq_lens),
-            prompt_lens=prompt_lens,
-
-            cu_seq_lens_q_cpu=cu_seq_lens_q,
-            seq_lens_cpu=seq_lens,
-            cache_slots_cpu=cache_slots
-        )
-        flat_input_ids = to_gpu(input_ids, dtype=torch.long)
-
-        return flat_input_ids, metadata
-
-    def _forward_pass(self, batch: list['Request'], is_prefill: bool):
-        input_ids, metadata = self._prepare_inputs(batch, is_prefill)
-
-        hidden_states = self.model(
-            input_ids=input_ids,
-            kv_cache=self.scheduler.kv_cache,
-            prefill=is_prefill,
-            metadata=metadata,
-            positions=metadata.positions
+        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        num_blocks = config.num_gpu_blocks or compute_num_blocks(
+            num_layers=model_config.num_hidden_layers,
+            num_kv_heads=model_config.num_key_value_heads,
+            head_dim=head_dim,
+            block_size=config.block_size,
+            dtype=dtype,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            device=device,
+            kv_cache_dtype=config.kv_cache_dtype,
+            reserve_bytes=config.kv_cache_reserve_mb * 1024 * 1024,
         )
 
-        last_token_indices = metadata.cu_seq_lens_q[1:] - 1
-        last_token_logits = hidden_states[last_token_indices]
+        kv_cache = PagedKVCache(
+            num_layers=model_config.num_hidden_layers,
+            num_kv_heads=model_config.num_key_value_heads,
+            head_dim=head_dim,
+            num_blocks=num_blocks,
+            block_size=config.block_size,
+            dtype=dtype,
+            device=device,
+            kv_cache_dtype=config.kv_cache_dtype,
+        )
 
-        return last_token_logits
+        engine = cls(
+            model=model,
+            kv_cache=kv_cache,
+            config=config,
+            eos_token_ids=_eos_token_ids(config.model, config.download_dir),
+        )
+        engine.warmup()
+        return engine
 
-    def _update_requests(self, batch: list['Request'], next_tokens_cpu: list[int]):
-        for req, next_tok in zip(batch, next_tokens_cpu):
-            if req.status == RequestStatus.RUNNING_PREFILL:
-                if req.num_computed_tokens >= req.num_prompt_tokens:
-                    req.output_token_ids.append(next_tok)
-                    req.all_token_ids.append(next_tok)
-                    req.status = RequestStatus.RUNNING_DECODE
-                else:
-                    self.scheduler.running_queue.remove(req)
-                    self.scheduler.waiting_queue.appendleft(req)
-            else:
-                req.output_token_ids.append(next_tok)
-                req.all_token_ids.append(next_tok)
-
-                if len(req.output_token_ids) >= req.sampling_params.max_tokens or next_tok in STOP_TOKENS:
-                    req.finished = True
-                    req.stop_reason = "finished" if next_tok in STOP_TOKENS else "max_tokens"
-                    req.status = RequestStatus.FINISHED
+    def warmup(self) -> None:
+        if self.device.type != "cuda":
+            return
+        self._warmup_forward()
+        self.runner.capture_decode_graphs()
+        self._graphs_ready = self.runner.uses_cuda_graphs
+        torch.cuda.synchronize()
 
     @torch.no_grad()
-    def step(self):
+    def _warmup_forward(self) -> None:
+        params = SamplingParams(temperature=0.0, max_tokens=2)
+        request = Request(
+            request_id="__warmup__",
+            prompt_token_ids=[1] * min(16, self.max_model_len - 2),
+            sampling_params=params,
+        )
+        self.scheduler.add_request(request)
+        guard = 0
+        while self.scheduler.has_work() and guard < 64:
+            self.step()
+            guard += 1
+        self.scheduler.abort_request(request.request_id)
+        self.block_manager.prefix_cache.clear()
+        for values in self.stats.values():
+            values.clear()
+        self.num_steps = 0
+
+    def add_request(self, request: Request) -> None:
+        self.scheduler.add_request(request)
+
+    def abort_request(self, request_id: str) -> bool:
+        self.sampler.release(request_id)
+        return self.scheduler.abort_request(request_id)
+
+    def abort_all(self) -> str:
+        self._drain_control_queue()
+        for request_id in list(self.scheduler.requests):
+            self.abort_request(request_id)
+        return "aborted"
+
+    def check_limits(self, num_prompt_tokens: int, max_tokens: int) -> None:
+        limit = self.max_model_len
+        if num_prompt_tokens >= limit:
+            raise ValueError(
+                f"prompt of {num_prompt_tokens} tokens does not fit in "
+                f"max_model_len={limit} (at least one token must remain for generation)"
+            )
+        if num_prompt_tokens + max_tokens > limit:
+            raise ValueError(
+                f"prompt of {num_prompt_tokens} tokens plus max_tokens={max_tokens} "
+                f"exceeds max_model_len={limit}"
+            )
+
+    def submit(self, request: Request) -> None:
+        self.check_limits(request.num_prompt_tokens, request.sampling_params.max_tokens)
+        self._pending_adds.put(request)
+
+    def request_abort(self, request_id: str) -> None:
+        self._pending_aborts.put(request_id)
+
+    def _drain_control_queue(self) -> None:
+        while True:
+            try:
+                request = self._pending_adds.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.scheduler.add_request(request)
+            except ValueError:
+                logger.exception("rejecting request %s", request.request_id)
+                request.finish(FinishReason.ABORT)
+
+        while True:
+            try:
+                request_id = self._pending_aborts.get_nowait()
+            except queue.Empty:
+                break
+            self.abort_request(request_id)
+
+    def has_work(self) -> bool:
+        return self.scheduler.has_work() or not self._pending_adds.empty()
+
+    def _on_sequence_admitted(self, request: Request) -> None:
+        self.runner.on_sequence_admitted(request)
+        self.token_history.reset_sequence(request.seq_index, request.all_token_ids)
+
+    def _on_sequence_released(self, request: Request) -> None:
+        self.runner.on_sequence_released(request)
+
+    @torch.no_grad()
+    def step(self) -> None:
+        step_start = time.perf_counter()
+        self._drain_control_queue()
+
         t0 = time.perf_counter()
-        prefill_batch, decode_batch, has_waiting = self.scheduler.schedule()
+        scheduled = self.scheduler.schedule()
         self.stats["scheduler_ms"].append((time.perf_counter() - t0) * 1000)
 
-        if not prefill_batch and not decode_batch:
+        if scheduled.is_empty():
             return
 
-        prefill_logits = None
-        decode_logits = None
+        prefill_batch = scheduled.prefill_batch
+        decode_batch = scheduled.decode_batch
 
-        pf_start = torch.cuda.Event(enable_timing=True)
-        pf_end   = torch.cuda.Event(enable_timing=True)
-        dc_start = torch.cuda.Event(enable_timing=True)
-        dc_end   = torch.cuda.Event(enable_timing=True)
+        completing: List[Request] = []
+        completing_rows: List[int] = []
+        for row, req in enumerate(prefill_batch):
+            if req.num_computed_tokens + req.current_chunk_size >= len(req.all_token_ids):
+                completing.append(req)
+                completing_rows.append(row)
 
-        if prefill_batch:
-            with torch.cuda.stream(self.prefill_stream):
-                pf_start.record(self.prefill_stream)
-                prefill_logits = self._forward_pass(prefill_batch, is_prefill=True)
-                pf_end.record(self.prefill_stream)
+        events = _StepEvents(self.device)
+        prepare_start = time.perf_counter()
 
-        if decode_batch:
-            with torch.cuda.stream(self.decode_stream):
-                dc_start.record(self.decode_stream)
-                decode_logits = self._forward_pass(decode_batch, is_prefill=False)
-                dc_end.record(self.decode_stream)
-
-        t_sync_start = time.perf_counter()
-        current_stream = torch.cuda.current_stream()
-        if prefill_batch:
-            current_stream.wait_stream(self.prefill_stream)
-        if decode_batch:
-            current_stream.wait_stream(self.decode_stream)
-
-
-        t_sample_start = time.perf_counter()
-
-        prefill_tokens_gpu = None
-        decode_tokens_gpu  = None
+        prefill_hidden = None
+        decode_hidden = None
 
         if prefill_batch:
-            prefill_tokens_gpu = self.sampler.sample(prefill_logits, [req.sampling_params for req in prefill_batch])
+            with self._stream(self.prefill_stream):
+                events.record_prefill_start()
+                hidden = self.runner.execute_prefill(prefill_batch)
+                if completing:
+                    rows = torch.tensor(completing_rows, device=self.device, dtype=torch.long)
+                    prefill_hidden = hidden.index_select(0, rows)
+                events.record_prefill_end()
+
         if decode_batch:
-            decode_tokens_gpu  = self.sampler.sample(decode_logits,  [req.sampling_params for req in decode_batch])
+            with self._stream(self.decode_stream):
+                events.record_decode_start()
+                decode_hidden = self.runner.execute_decode(decode_batch)
+                events.record_decode_end()
 
-        all_tokens_gpu = torch.cat([
-            t for t in [prefill_tokens_gpu, decode_tokens_gpu] if t is not None
-        ])
+        self.stats["prepare_ms"].append((time.perf_counter() - prepare_start) * 1000)
 
-        all_tokens_cpu = all_tokens_gpu.cpu().tolist()
+        current = torch.cuda.current_stream(self.device) if self.device.type == "cuda" else None
+        if current is not None:
+            if prefill_batch:
+                current.wait_stream(self.prefill_stream)
+                if prefill_hidden is not None:
+                    prefill_hidden.record_stream(current)
+            if decode_batch:
+                current.wait_stream(self.decode_stream)
+                if decode_hidden is not None and not self.runner.uses_cuda_graphs:
+                    decode_hidden.record_stream(current)
 
-        self.stats["cpu_sync_wait_ms"].append((time.perf_counter() - t_sync_start) * 1000)
+        sample_start = time.perf_counter()
+        sampled_requests = completing + decode_batch
+        if not sampled_requests:
+            self._advance_partial_prefills(prefill_batch)
+            self.num_steps += 1
+            self.stats["step_ms"].append((time.perf_counter() - step_start) * 1000)
+            return
 
-        if prefill_batch:
-            self.stats["prefill_gpu_ms"].append(pf_start.elapsed_time(pf_end))
-        if decode_batch:
-            self.stats["decode_gpu_ms"].append(dc_start.elapsed_time(dc_end))
+        pieces = [h for h in (prefill_hidden, decode_hidden) if h is not None]
+        hidden_states = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        logits = self.model.compute_logits(hidden_states)
 
-        self.stats["sampling_ms"].append((time.perf_counter() - t_sample_start) * 1000)
+        seq_indices = torch.tensor(
+            [req.seq_index for req in sampled_requests], dtype=torch.long, device=self.device
+        )
+        history_width = max(req.num_tokens for req in sampled_requests)
+        tokens_gpu = self.sampler.sample(
+            logits,
+            [req.sampling_params for req in sampled_requests],
+            request_ids=[req.request_id for req in sampled_requests],
+            history=self.token_history,
+            seq_indices=seq_indices,
+            history_width=history_width,
+        )
+        self.token_history.append(seq_indices, tokens_gpu)
 
-        if prefill_batch:
-            n = len(prefill_batch)
-            self._update_requests(prefill_batch, all_tokens_cpu[:n])
-        if decode_batch:
-            n_pre = len(prefill_batch) if prefill_batch else 0
-            self._update_requests(decode_batch, all_tokens_cpu[n_pre:])
+        sync_start = time.perf_counter()
+        # The one place per step where the host waits on the device.
+        tokens = tokens_gpu.tolist()
+        self.stats["cpu_sync_wait_ms"].append((time.perf_counter() - sync_start) * 1000)
+        self.stats["sampling_ms"].append((time.perf_counter() - sample_start) * 1000)
+
+        events.collect(self.stats, bool(prefill_batch), bool(decode_batch))
+
+        self._advance_partial_prefills(prefill_batch)
+        self._apply_tokens(sampled_requests, tokens, num_prefill=len(completing))
+
+        self.num_steps += 1
+        self.stats["step_ms"].append((time.perf_counter() - step_start) * 1000)
+
+    def _stream(self, stream):
+        if stream is None:
+            return _NullContext()
+        return torch.cuda.stream(stream)
+
+    def _advance_partial_prefills(self, prefill_batch: Sequence[Request]) -> None:
+        for request in prefill_batch:
+            request.num_computed_tokens += request.current_chunk_size
+            self.scheduler.commit(request)
+            request.refresh_status()
+
+    def _apply_tokens(
+        self, requests: Sequence[Request], tokens: List[int], num_prefill: int
+    ) -> None:
+        for position, (request, token) in enumerate(zip(requests, tokens)):
+            if position >= num_prefill:
+                request.num_computed_tokens += 1
+                self.scheduler.commit(request)
+
+            request.append_token(token)
+            request.refresh_status()
+
+            reason = request.should_stop(token, self.eos_token_ids)
+            if reason is not None:
+                request.finish(reason)
+                self.sampler.release(request.request_id)
+
+    @torch.no_grad()
+    def generate(
+        self, requests: Sequence[Request], max_steps: Optional[int] = None
+    ) -> List[Request]:
+        for request in requests:
+            self.add_request(request)
+        steps = 0
+        while self.has_work():
+            self.step()
+            steps += 1
+            if max_steps is not None and steps >= max_steps:
+                break
+        return list(requests)
+
+    def snapshot(self) -> Dict[str, float]:
+        stats = self.scheduler.stats()
+        stats["num_steps"] = float(self.num_steps)
+        stats["cuda_graphs"] = 1.0 if self._graphs_ready else 0.0
+        stats["kv_cache_bytes"] = float(self.kv_cache.total_bytes())
+        return stats
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _StepEvents:
+    def __init__(self, device: torch.device) -> None:
+        self.enabled = device.type == "cuda"
+        if not self.enabled:
+            return
+        self.prefill_start = torch.cuda.Event(enable_timing=True)
+        self.prefill_end = torch.cuda.Event(enable_timing=True)
+        self.decode_start = torch.cuda.Event(enable_timing=True)
+        self.decode_end = torch.cuda.Event(enable_timing=True)
+
+    def record_prefill_start(self) -> None:
+        if self.enabled:
+            self.prefill_start.record()
+
+    def record_prefill_end(self) -> None:
+        if self.enabled:
+            self.prefill_end.record()
+
+    def record_decode_start(self) -> None:
+        if self.enabled:
+            self.decode_start.record()
+
+    def record_decode_end(self) -> None:
+        if self.enabled:
+            self.decode_end.record()
+
+    def collect(self, stats: Dict[str, List[float]], had_prefill: bool, had_decode: bool) -> None:
+        if not self.enabled:
+            return
+        if had_prefill:
+            stats["prefill_gpu_ms"].append(self.prefill_start.elapsed_time(self.prefill_end))
+        if had_decode:
+            stats["decode_gpu_ms"].append(self.decode_start.elapsed_time(self.decode_end))
+
+
+def _eos_token_ids(model_id: str, cache_dir: Optional[str]) -> FrozenSet[int]:
+    try:
+        from transformers import GenerationConfig
+
+        generation_config = GenerationConfig.from_pretrained(model_id, cache_dir=cache_dir)
+        eos = generation_config.eos_token_id
+    except Exception:
+        return DEFAULT_EOS_TOKEN_IDS
+
+    if eos is None:
+        return DEFAULT_EOS_TOKEN_IDS
+    if isinstance(eos, int):
+        return frozenset({eos})
+    return frozenset(int(token) for token in eos)

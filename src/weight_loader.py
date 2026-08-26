@@ -112,8 +112,7 @@ def load_state_dict_into_model(
     state_dict: Dict[str, torch.Tensor],
     strict: bool = True,
 ) -> None:
-    params = dict(model.named_parameters())
-    params.update(dict(model.named_buffers()))
+    params = dict(model.state_dict(keep_vars=True))
 
     missing: List[str] = []
     for name, param in params.items():

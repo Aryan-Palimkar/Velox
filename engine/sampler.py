@@ -25,7 +25,10 @@ class SamplingTensors:
 
     @staticmethod
     def build(
-        params: Sequence[SamplingParams], device: torch.device, vocab_size: int
+        params: Sequence[SamplingParams],
+        device: torch.device,
+        vocab_size: int,
+        staging: Optional["_Staging"] = None,
     ) -> "SamplingTensors":
         rows = [
             [
@@ -38,7 +41,12 @@ class SamplingTensors:
             ]
             for p in params
         ]
-        packed = torch.tensor(rows, dtype=torch.float32).pin_memory().to(device, non_blocking=True)
+        if staging is not None:
+            packed = staging.upload(rows)
+        else:
+            packed = torch.tensor(rows, dtype=torch.float32).pin_memory().to(
+                device, non_blocking=True
+            )
         top_k_values = [int(row[2]) for row in rows]
         return SamplingTensors(
             temperature=packed[:, 0],
@@ -52,6 +60,38 @@ class SamplingTensors:
             no_penalties=not any(p.has_penalties for p in params),
             max_top_k=max(top_k_values) if top_k_values else 0,
         )
+
+
+class _Staging:
+    def __init__(self, max_rows: int, num_columns: int, device: torch.device) -> None:
+        pin = device.type == "cuda"
+        self.host = torch.zeros((max_rows, num_columns), dtype=torch.float32, pin_memory=pin)
+        self.device_buffer = torch.zeros(
+            (max_rows, num_columns), dtype=torch.float32, device=device
+        )
+
+    def upload(self, rows: Sequence[Sequence[float]]) -> torch.Tensor:
+        count = len(rows)
+        if count > self.host.shape[0]:
+            raise ValueError(f"staging buffer holds {self.host.shape[0]} rows, got {count}")
+        self.host[:count] = torch.tensor(rows, dtype=torch.float32)
+        self.device_buffer[:count].copy_(self.host[:count], non_blocking=True)
+        return self.device_buffer[:count]
+
+
+class IndexStaging:
+    def __init__(self, capacity: int, device: torch.device) -> None:
+        pin = device.type == "cuda"
+        self.host = torch.zeros(capacity, dtype=torch.long, pin_memory=pin)
+        self.device_buffer = torch.zeros(capacity, dtype=torch.long, device=device)
+
+    def upload(self, values: Sequence[int]) -> torch.Tensor:
+        count = len(values)
+        if count > self.host.shape[0]:
+            raise ValueError(f"staging buffer holds {self.host.shape[0]} entries, got {count}")
+        self.host[:count] = torch.tensor(values, dtype=torch.long)
+        self.device_buffer[:count].copy_(self.host[:count], non_blocking=True)
+        return self.device_buffer[:count]
 
 
 class TokenHistory:
@@ -83,9 +123,10 @@ class TokenHistory:
 
 
 class Sampler:
-    def __init__(self, device: torch.device | str = "cuda") -> None:
+    def __init__(self, device: torch.device | str = "cuda", max_num_seqs: int = 256) -> None:
         self.device = torch.device(device)
         self._generators: Dict[str, torch.Generator] = {}
+        self._staging = _Staging(max_num_seqs, 6, self.device)
 
     def sample(
         self,
@@ -102,7 +143,9 @@ class Sampler:
                 f"got {len(sampling_params)} sampling params for a batch of {batch}"
             )
 
-        tensors = SamplingTensors.build(sampling_params, self.device, vocab_size)
+        tensors = SamplingTensors.build(
+            sampling_params, self.device, vocab_size, staging=self._staging
+        )
         logits = logits.to(torch.float32)
 
         if not tensors.no_penalties and history is not None and seq_indices is not None:

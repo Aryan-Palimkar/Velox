@@ -14,7 +14,7 @@ from src.transformer import QwenForCausalLM
 from .config import EngineConfig
 from .model_runner import ModelRunner
 from .request import FinishReason, Request
-from .sampler import Sampler, TokenHistory
+from .sampler import IndexStaging, Sampler, TokenHistory
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .utils import SamplingParams
 
@@ -67,12 +67,15 @@ class Engine:
             device=self.device,
             enable_cuda_graphs=config.enable_cuda_graphs,
         )
-        self.sampler = Sampler(device=self.device)
+        self.sampler = Sampler(device=self.device, max_num_seqs=config.max_num_seqs)
         self.token_history = TokenHistory(
             max_num_seqs=config.max_num_seqs,
             max_model_len=self.max_model_len,
             device=self.device,
         )
+
+        self._logit_row_staging = IndexStaging(config.max_num_seqs, self.device)
+        self._seq_index_staging = IndexStaging(config.max_num_seqs, self.device)
 
         self.scheduler.on_sequence_admitted = self._on_sequence_admitted
         self.scheduler.on_sequence_released = self._on_sequence_released
@@ -177,18 +180,30 @@ class Engine:
 
     @torch.no_grad()
     def _warmup_forward(self) -> None:
-        params = SamplingParams(temperature=0.0, max_tokens=2)
-        request = Request(
-            request_id="__warmup__",
-            prompt_token_ids=[1] * min(16, self.max_model_len - 2),
-            sampling_params=params,
+        limit = self.max_model_len - 2
+        lengths = sorted(
+            {
+                min(self.config.max_prefill_chunk_size, limit),
+                min(64, limit),
+                min(8, limit),
+            }
         )
-        self.scheduler.add_request(request)
-        guard = 0
-        while self.scheduler.has_work() and guard < 64:
-            self.step()
-            guard += 1
-        self.scheduler.abort_request(request.request_id)
+        params = SamplingParams(temperature=0.0, max_tokens=2)
+        for index, length in enumerate(lengths):
+            if length < 1:
+                continue
+            request = Request(
+                request_id=f"__warmup_{index}__",
+                prompt_token_ids=[1] * length,
+                sampling_params=params,
+            )
+            self.scheduler.add_request(request)
+            guard = 0
+            while self.scheduler.has_work() and guard < 128:
+                self.step()
+                guard += 1
+            self.scheduler.abort_request(request.request_id)
+
         self.block_manager.prefix_cache.clear()
         for values in self.stats.values():
             values.clear()
@@ -289,7 +304,7 @@ class Engine:
                 events.record_prefill_start()
                 hidden = self.runner.execute_prefill(prefill_batch)
                 if completing:
-                    rows = torch.tensor(completing_rows, device=self.device, dtype=torch.long)
+                    rows = self._logit_row_staging.upload(completing_rows)
                     prefill_hidden = hidden.index_select(0, rows)
                 events.record_prefill_end()
 
@@ -324,8 +339,8 @@ class Engine:
         hidden_states = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
         logits = self.model.compute_logits(hidden_states)
 
-        seq_indices = torch.tensor(
-            [req.seq_index for req in sampled_requests], dtype=torch.long, device=self.device
+        seq_indices = self._seq_index_staging.upload(
+            [req.seq_index for req in sampled_requests]
         )
         history_width = max(req.num_tokens for req in sampled_requests)
         tokens_gpu = self.sampler.sample(

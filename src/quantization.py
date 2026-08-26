@@ -208,10 +208,10 @@ def _wq_gemm_kernel(
         b_q = tl.load(
             b_ptrs,
             mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
-            other=0,
+            other=0.0,
         )
-        b = b_q.to(tl.float32)
-        acc += tl.dot(a.to(tl.float32), b, allow_tf32=True)
+        # Exact for int8 and fp8-e4m3; the per-column scale folds in after the loop.
+        acc += tl.dot(a, b_q.to(a.dtype))
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -232,10 +232,10 @@ def _wq_gemm_kernel(
 
 def _gemm_config(m: int) -> dict:
     if m <= 16:
-        return dict(BLOCK_M=16, BLOCK_N=128, BLOCK_K=64, GROUP_M=1, num_warps=4, num_stages=4)
-    if m <= 64:
-        return dict(BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, GROUP_M=4, num_warps=4, num_stages=3)
-    return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=3)
+        return dict(BLOCK_M=16, BLOCK_N=128, BLOCK_K=128, GROUP_M=1, num_warps=8, num_stages=4)
+    if m <= 128:
+        return dict(BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
+    return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
 
 
 def quantized_matmul(

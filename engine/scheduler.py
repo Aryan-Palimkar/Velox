@@ -219,13 +219,17 @@ class Scheduler:
         return max(0, limit)
 
     def _schedule_running_prefills(self, output: SchedulerOutput, token_budget: int) -> int:
-        for position, request in enumerate(list(self.running)):
+        is_oldest_prefill = True
+        for request in list(self.running):
             if request.status is not RequestStatus.RUNNING_PREFILL:
                 continue
             if request not in self.running:
                 continue
             if token_budget <= 0:
                 break
+
+            oldest = is_oldest_prefill
+            is_oldest_prefill = False
 
             wanted = min(
                 request.num_uncomputed_tokens,
@@ -234,7 +238,7 @@ class Scheduler:
             )
             chunk = min(wanted, self._max_chunk(request, self.block_manager.num_available_blocks()))
 
-            while chunk <= 0 and position == 0 and len(self.running) > 1:
+            while chunk <= 0 and oldest and self.running and self.running[-1] is not request:
                 victim = self.running[-1]
                 self._preempt(victim)
                 output.preempted.append(victim)

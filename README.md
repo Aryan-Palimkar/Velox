@@ -214,7 +214,7 @@ pytest -m "not slow"        # unit tests only, ~12 s
 pytest -m gpu               # anything needing CUDA
 ```
 
-The suite is 160 tests. The ones that matter most:
+The suite is 190 tests. The ones that matter most:
 
 - **Kernel equivalence** (`test_paged_attention.py`) — paged prefill and decode against `F.scaled_dot_product_attention`, over deliberately fragmented block tables so a kernel that assumed contiguity fails rather than accidentally passes. Covers chunked prefill, cached prefixes, split-K, and both quantized KV dtypes.
 - **Teacher-forced logits** (`test_engine_e2e.py`) — a whole sequence compared against HuggingFace in one pass, so every position is checked independently instead of only the first divergence.

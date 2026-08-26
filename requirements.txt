@@ -1,13 +1,22 @@
+# Velox targets an Ada or newer NVIDIA GPU (compute capability 8.9+ is required
+# for the FP8 KV cache; everything else runs on 8.0+). Pick the PyTorch build
+# that matches your CUDA toolkit — the cu118 index below is one working choice.
 --extra-index-url https://download.pytorch.org/whl/cu118
 
-torch==2.3.1+cu118
-triton==2.3.1
+torch>=2.4.0
+triton>=3.0.0
 
-transformers==4.44.2
-huggingface_hub==0.24.6
-safetensors==0.4.5
-tokenizers==0.19.1
-tiktoken==0.7.0
-sentencepiece==0.2.0
-numpy==1.26.4
-pytest==8.3.2
+transformers>=4.44.0
+huggingface_hub>=0.24.0
+safetensors>=0.4.5
+tokenizers>=0.19.1
+numpy>=1.26.0
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.6.0
+
+# Testing and benchmarking.
+pytest>=8.0.0
+httpx>=0.27.0
+openai>=1.30.0

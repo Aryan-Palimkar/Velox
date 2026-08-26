@@ -149,9 +149,6 @@ class PagedKVCache:
             return keys.to(self.model_dtype), values.to(self.model_dtype)
         return keys, values
 
-    def reset(self) -> None:
-        self.allocator = BlockAllocator(self.num_blocks)
-
     def __repr__(self) -> str:
         return (
             f"PagedKVCache(layers={self.num_layers}, blocks={self.num_blocks}, "

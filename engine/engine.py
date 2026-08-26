@@ -107,6 +107,7 @@ class Engine:
         cls, config: Optional[EngineConfig] = None, **overrides
     ) -> "Engine":
         from src.config import ModelConfig
+        from src.utils import seed_everything
         from src.weight_loader import load_qwen_weights
 
         config = config or EngineConfig(**overrides)
@@ -115,7 +116,7 @@ class Engine:
         device = torch.device(config.device)
         dtype = config.torch_dtype()
         if config.seed is not None:
-            torch.manual_seed(config.seed)
+            seed_everything(config.seed)
 
         model_config = ModelConfig.from_hf(config.model, cache_dir=config.download_dir)
         max_model_len = min(config.max_model_len, model_config.max_position_embeddings)

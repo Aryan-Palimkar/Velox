@@ -284,35 +284,42 @@ def report(result: Dict, engine: Engine, show_outputs: bool = False) -> None:
 def run_huggingface_baseline(
     model_id: str, tokenizer, conversations: Sequence[Sequence[dict]], max_tokens: int
 ) -> Dict:
+    import transformers
     from transformers import AutoModelForCausalLM
 
+    transformers.logging.set_verbosity_error()
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=torch.bfloat16
     ).to("cuda").eval()
 
-    start = time.perf_counter()
-    generated = 0
-    prompt_tokens = 0
-    ttfts = []
-
+    encoded = []
     for messages in conversations:
         prompt = tokenizer.apply_chat_template(
             list(messages), tokenize=False, add_generation_prompt=True
         )
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
-        prompt_tokens += input_ids.shape[1]
+        encoded.append(tokenizer(prompt, return_tensors="pt").input_ids.to("cuda"))
 
+    with torch.no_grad():
+        model.generate(encoded[0], max_new_tokens=2, do_sample=False,
+                       pad_token_id=tokenizer.eos_token_id)
+    torch.cuda.synchronize()
+
+    ttfts = []
+    for input_ids in encoded:
         request_start = time.perf_counter()
         with torch.no_grad():
-            first = model.generate(
-                input_ids,
-                max_new_tokens=1,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            model.generate(input_ids, max_new_tokens=1, do_sample=False,
+                           pad_token_id=tokenizer.eos_token_id)
         torch.cuda.synchronize()
         ttfts.append(time.perf_counter() - request_start)
 
+    start = time.perf_counter()
+    generated = 0
+    prompt_tokens = 0
+    loaded_ttfts = []
+    for input_ids, isolated_ttft in zip(encoded, ttfts):
+        loaded_ttfts.append(time.perf_counter() - start + isolated_ttft)
+        prompt_tokens += input_ids.shape[1]
         with torch.no_grad():
             output = model.generate(
                 input_ids,
@@ -321,7 +328,6 @@ def run_huggingface_baseline(
                 pad_token_id=tokenizer.eos_token_id,
             )
         generated += output.shape[1] - input_ids.shape[1]
-        del first
 
     torch.cuda.synchronize()
     wall = time.perf_counter() - start
@@ -335,7 +341,8 @@ def run_huggingface_baseline(
         "prompt_tokens": prompt_tokens,
         "generated_tokens": generated,
         "decode_throughput": generated / wall if wall else 0.0,
-        "ttft": summarise(ttfts),
+        "ttft": summarise(loaded_ttfts),
+        "ttft_isolated": summarise(ttfts),
     }
 
 
@@ -371,6 +378,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="also run a sequential transformers baseline")
     parser.add_argument("--sweep-batch-size", default=None,
                         help="comma-separated max_num_seqs values to sweep")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="replay the workload N times; later rounds see a warm "
+                             "prefix cache, which is what a real server looks like "
+                             "when a system prompt recurs")
     parser.add_argument("--show-outputs", action="store_true")
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -445,14 +456,33 @@ def main(argv: Optional[List[str]] = None) -> None:
         engine = Engine.from_pretrained(config)
         torch.cuda.reset_peak_memory_stats()
 
-        label = f"velox(max_num_seqs={max_num_seqs})"
-        result = run_workload(engine, tokenizer, conversations, sampling_params, label=label)
-        result["kv_blocks"] = engine.block_manager.num_total_blocks
-        result["kv_capacity_tokens"] = engine.kv_cache.num_slots
-        result["prefix_hit_rate"] = engine.block_manager.prefix_cache.hit_rate
-        report(result, engine, show_outputs=args.show_outputs)
-        results.append(result)
+        round_results = []
+        for round_index in range(args.rounds):
+            for values in engine.stats.values():
+                values.clear()
+            torch.cuda.reset_peak_memory_stats()
 
+            suffix = f" round={round_index + 1}" if args.rounds > 1 else ""
+            label = f"velox(max_num_seqs={max_num_seqs}){suffix}"
+            result = run_workload(engine, tokenizer, conversations, sampling_params, label=label)
+            result["kv_blocks"] = engine.block_manager.num_total_blocks
+            result["kv_capacity_tokens"] = engine.kv_cache.num_slots
+            result["prefix_hit_rate"] = engine.block_manager.prefix_cache.hit_rate
+            report(result, engine, show_outputs=args.show_outputs and round_index == 0)
+            round_results.append(result)
+
+        if args.rounds > 1:
+            rule("PREFIX CACHE WARM-UP")
+            print(f"  {'round':>7}{'wall(s)':>10}{'TTFT p50':>11}{'prompt cached':>15}{'tok/s':>10}")
+            for index, result in enumerate(round_results, start=1):
+                share = result["cached_prompt_tokens"] / max(1, result["prompt_tokens"])
+                print(
+                    f"  {index:>7}{result['wall_seconds']:>10.3f}"
+                    f"{result['ttft']['p50']:>11.3f}{share:>14.1%}"
+                    f"{result['decode_throughput']:>10.2f}"
+                )
+
+        results.extend(round_results)
         del engine
         torch.cuda.empty_cache()
 
@@ -462,30 +492,41 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         results.append(baseline)
         rule("HUGGINGFACE BASELINE (sequential)")
-        print(f"  Wall time         : {baseline['wall_seconds']:.3f} s")
-        print(f"  Generated tokens  : {baseline['generated_tokens']}")
-        print(f"  Decode throughput : {baseline['decode_throughput']:.2f} tok/s")
-        print(f"  Mean TTFT         : {baseline['ttft']['mean']:.3f} s")
+        print(f"  Wall time              : {baseline['wall_seconds']:.3f} s")
+        print(f"  Generated tokens       : {baseline['generated_tokens']}")
+        print(f"  Decode throughput      : {baseline['decode_throughput']:.2f} tok/s")
+        print(f"  TTFT alone (mean)      : {baseline['ttft_isolated']['mean']:.3f} s")
+        print(
+            f"  TTFT under load (mean) : {baseline['ttft']['mean']:.3f} s  "
+            f"p99={baseline['ttft']['p99']:.3f} s"
+        )
 
         velox = results[0]
         rule("SPEEDUP")
-        print(f"  Wall time         : {baseline['wall_seconds'] / velox['wall_seconds']:.2f}x")
+        print(f"  Wall time              : {baseline['wall_seconds'] / velox['wall_seconds']:.2f}x")
         print(
-            f"  Decode throughput : "
+            f"  Decode throughput      : "
             f"{velox['decode_throughput'] / max(baseline['decode_throughput'], 1e-9):.2f}x"
         )
         print(
-            f"  Mean TTFT         : "
+            f"  TTFT under load (mean) : "
             f"{baseline['ttft']['mean'] / max(velox['ttft']['mean'], 1e-9):.2f}x lower"
         )
+        print(
+            f"  TTFT under load (p99)  : "
+            f"{baseline['ttft']['p99'] / max(velox['ttft']['p99'], 1e-9):.2f}x lower"
+        )
 
-    if len(batch_sizes) > 1:
+    if len(batch_sizes) > 1 and args.rounds == 1:
         rule("BATCH SIZE SWEEP")
-        print(f"  {'max_num_seqs':>14}{'wall(s)':>10}{'tok/s':>10}{'TTFT p50':>11}{'ITL p50':>10}{'preempt':>9}")
+        print(
+            f"  {'max_num_seqs':>14}{'kv_blocks':>11}{'peak_used':>11}{'wall(s)':>10}"
+            f"{'tok/s':>10}{'TTFT p50':>11}{'ITL p50':>10}{'preempt':>9}"
+        )
         for size, result in zip(batch_sizes, results):
             print(
-                f"  {size:>14}{result['wall_seconds']:>10.2f}"
-                f"{result['decode_throughput']:>10.2f}"
+                f"  {size:>14}{result['kv_blocks']:>11}{result['max_blocks_used']:>11}"
+                f"{result['wall_seconds']:>10.2f}{result['decode_throughput']:>10.2f}"
                 f"{result['ttft']['p50']:>11.3f}{result['itl_ms']['p50']:>10.2f}"
                 f"{result['preemptions']:>9}"
             )

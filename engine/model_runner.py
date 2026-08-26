@@ -63,7 +63,6 @@ class BatchBuffers:
         self.h_seq_lens = pinned((max_num_seqs,), torch.int32)
         self.h_cu_seq_lens_q = pinned((max_num_seqs + 1,), torch.int32)
         self.h_gather_index = pinned((max_num_seqs,), torch.long)
-        self.h_block_row = pinned((max_blocks_per_seq,), torch.int32)
 
     @staticmethod
     def stage(host: torch.Tensor, device: torch.Tensor, values: np.ndarray) -> None:
@@ -110,6 +109,14 @@ class ModelRunner:
         self.block_tables_by_seq = torch.zeros(
             (max_num_seqs + 1, self.max_blocks_per_seq), dtype=torch.int32, device=self.device
         )
+        # One pinned row per slot. A shared scratch row gets overwritten by the next
+        # request in the batch before its async copy has run.
+        self.h_block_tables_by_seq = torch.zeros(
+            (max_num_seqs + 1, self.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.device.type == "cuda",
+        )
         self.pad_row = max_num_seqs
         self._synced_blocks = [0] * (max_num_seqs + 1)
 
@@ -135,18 +142,17 @@ class ModelRunner:
         if request.seq_index is not None:
             self._synced_blocks[request.seq_index] = 0
 
-    def _sync_block_table(self, request: Request, buffers: BatchBuffers) -> None:
+    def _sync_block_table(self, request: Request) -> None:
         slot = request.seq_index
         synced = self._synced_blocks[slot]
         total = len(request.block_table)
         if total <= synced:
             return
-        count = total - synced
-        buffers.h_block_row[:count] = torch.tensor(
+        self.h_block_tables_by_seq[slot, synced:total] = torch.tensor(
             request.block_table[synced:total], dtype=torch.int32
         )
         self.block_tables_by_seq[slot, synced:total].copy_(
-            buffers.h_block_row[:count], non_blocking=True
+            self.h_block_tables_by_seq[slot, synced:total], non_blocking=True
         )
         self._synced_blocks[slot] = total
 
@@ -161,7 +167,7 @@ class ModelRunner:
         query_lens: List[int] = []
 
         for request in batch:
-            self._sync_block_table(request, buffers)
+            self._sync_block_table(request)
             start = request.num_computed_tokens
             length = request.current_chunk_size
             end = start + length
@@ -218,7 +224,7 @@ class ModelRunner:
         kv_lens = np.ones(total, dtype=np.int32)
 
         for row, request in enumerate(batch):
-            self._sync_block_table(request, buffers)
+            self._sync_block_table(request)
             computed = request.num_computed_tokens
             input_ids[row] = request.all_token_ids[computed]
             positions[row] = computed

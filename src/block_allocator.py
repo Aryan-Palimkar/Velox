@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence
+from typing import Iterable, List
 
 # Reserved. Padded cuda graph rows point here so they always hit a valid address.
 NULL_BLOCK = 0

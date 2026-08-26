@@ -15,7 +15,7 @@ from .config import EngineConfig
 from .model_runner import ModelRunner
 from .request import FinishReason, Request
 from .sampler import IndexStaging, Sampler, TokenHistory
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .scheduler import Scheduler, SchedulerConfig
 from .utils import SamplingParams
 
 logger = logging.getLogger(__name__)

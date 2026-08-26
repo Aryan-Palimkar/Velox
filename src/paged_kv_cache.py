@@ -149,6 +149,9 @@ class PagedKVCache:
             return keys.to(self.model_dtype), values.to(self.model_dtype)
         return keys, values
 
+    def reset(self) -> None:
+        self.allocator = BlockAllocator(self.num_blocks)
+
     def __repr__(self) -> str:
         return (
             f"PagedKVCache(layers={self.num_layers}, blocks={self.num_blocks}, "
@@ -181,7 +184,6 @@ def compute_num_blocks(
         raise ValueError("compute_num_blocks requires a CUDA device")
 
     free_bytes, _ = torch.cuda.mem_get_info(device)
-    free_bytes += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     budget = int(free_bytes * gpu_memory_utilization) - reserve_bytes
     if budget <= 0:
         raise RuntimeError(

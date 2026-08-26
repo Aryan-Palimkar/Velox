@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import logging
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from torch import nn
-
-logger = logging.getLogger(__name__)
 
 FP8_E4M3_MAX = 448.0
 FP8_E5M2_MAX = 57344.0
@@ -59,16 +56,6 @@ def resolve_kv_cache_dtype(kv_cache_dtype: str, model_dtype: torch.dtype) -> Tup
     if target in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_supported():
         raise RuntimeError(
             f"kv_cache_dtype={kv_cache_dtype!r} requires compute capability 8.9 or newer"
-        )
-    if target is torch.float8_e4m3fn:
-        logger.warning(
-            "kv_cache_dtype=fp8 costs noticeably more accuracy than int8 at the "
-            "same size; prefer int8 unless you specifically need FP8 storage"
-        )
-    elif target is torch.float8_e5m2:
-        logger.warning(
-            "kv_cache_dtype=fp8_e5m2 keeps only 2 mantissa bits and degrades "
-            "output quality substantially; it is provided for completeness"
         )
     return target, True
 
@@ -221,10 +208,10 @@ def _wq_gemm_kernel(
         b_q = tl.load(
             b_ptrs,
             mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
-            other=0.0,
+            other=0,
         )
-        # Exact for int8 and fp8-e4m3; the per-column scale folds in after the loop.
-        acc += tl.dot(a, b_q.to(a.dtype))
+        b = b_q.to(tl.float32)
+        acc += tl.dot(a.to(tl.float32), b, allow_tf32=True)
 
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -245,10 +232,10 @@ def _wq_gemm_kernel(
 
 def _gemm_config(m: int) -> dict:
     if m <= 16:
-        return dict(BLOCK_M=16, BLOCK_N=128, BLOCK_K=128, GROUP_M=1, num_warps=8, num_stages=4)
-    if m <= 128:
-        return dict(BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
-    return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=4, num_stages=4)
+        return dict(BLOCK_M=16, BLOCK_N=128, BLOCK_K=64, GROUP_M=1, num_warps=4, num_stages=4)
+    if m <= 64:
+        return dict(BLOCK_M=32, BLOCK_N=128, BLOCK_K=64, GROUP_M=4, num_warps=4, num_stages=3)
+    return dict(BLOCK_M=64, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=3)
 
 
 def quantized_matmul(
@@ -271,8 +258,9 @@ def quantized_matmul(
     num_warps = config.pop("num_warps")
     num_stages = config.pop("num_stages")
 
-    def grid(meta):
-        return (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
+    grid = lambda meta: (
+        triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
+    )
     _wq_gemm_kernel[grid](
         x, qweight, scale, bias if bias is not None else x, out,
         m, n, k,

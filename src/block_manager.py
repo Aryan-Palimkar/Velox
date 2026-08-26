@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
-from .block_allocator import BlockAllocator, OutOfBlocksError
+from .block_allocator import NULL_BLOCK, BlockAllocator, OutOfBlocksError
 from .paged_kv_cache import PagedKVCache
 from .radix_cache import RadixCache
 
@@ -53,13 +53,11 @@ class BlockSpaceManager:
         if not self.prefix_cache.enabled or request.block_table:
             return 0
 
-        tokens = request.all_token_ids
-        # Leave one token uncomputed or there is nothing to sample from.
-        max_blocks = max(0, (len(tokens) - 1) // self.block_size)
+        max_blocks = max(0, (request.num_prompt_tokens - 1) // self.block_size)
         if max_blocks == 0:
             return 0
 
-        matched = self.prefix_cache.match_prefix(tokens, max_blocks=max_blocks)
+        matched = self.prefix_cache.match_prefix(request.prompt_token_ids, max_blocks=max_blocks)
         if not matched:
             return 0
 
@@ -126,6 +124,22 @@ class BlockSpaceManager:
     def slot_for(self, request, token_index: int) -> int:
         block = request.block_table[token_index // self.block_size]
         return block * self.block_size + (token_index % self.block_size)
+
+    def slot_range(self, request, start: int, count: int) -> List[int]:
+        block_size = self.block_size
+        table = request.block_table
+        return [
+            table[i // block_size] * block_size + (i % block_size)
+            for i in range(start, start + count)
+        ]
+
+    def padded_block_table(self, request, width: int) -> List[int]:
+        table = request.block_table
+        if len(table) > width:
+            raise ValueError(
+                f"block table of length {len(table)} exceeds the tensor width {width}"
+            )
+        return table + [NULL_BLOCK] * (width - len(table))
 
     def stats(self) -> dict:
         return {

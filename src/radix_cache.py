@@ -175,19 +175,16 @@ class RadixCache:
             return 0
 
         freed = 0
-        deferred: List[Tuple[int, int, RadixNode]] = []
-
         while freed < num_blocks and self._evict_heap:
-            entry = heapq.heappop(self._evict_heap)
-            last_access, _node_id, node = entry
+            last_access, node_id, node = heapq.heappop(self._evict_heap)
 
-            if id(node) not in self._nodes or node.last_access != last_access or not node.is_leaf:
+            if id(node) not in self._nodes:
                 continue
-
+            if node.last_access != last_access:
+                continue
+            if not node.is_leaf:
+                continue
             if self.allocator.ref_count(node.physical_block) != 1:
-                # Still held by a live request. Keep the entry or the node becomes
-                # permanently unevictable.
-                deferred.append(entry)
                 continue
 
             parent = node.parent
@@ -197,8 +194,6 @@ class RadixCache:
             if parent is not None and not parent.is_root and parent.is_leaf:
                 self._push_leaf(parent)
 
-        for entry in deferred:
-            heapq.heappush(self._evict_heap, entry)
         return freed
 
     def _remove_node(self, node: RadixNode) -> None:

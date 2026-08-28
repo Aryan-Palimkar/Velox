@@ -64,6 +64,18 @@ class BatchBuffers:
         self.h_cu_seq_lens_q = pinned((max_num_seqs + 1,), torch.int32)
         self.h_gather_index = pinned((max_num_seqs,), torch.long)
 
+        # A step that only advances a partial prefill never reaches the sampler, so it
+        # never syncs anywhere else. This is what makes reusing the buffers safe.
+        self._copies_done = torch.cuda.Event() if device.type == "cuda" else None
+
+    def wait_for_prior_copies(self) -> None:
+        if self._copies_done is not None:
+            self._copies_done.synchronize()
+
+    def mark_copies_enqueued(self) -> None:
+        if self._copies_done is not None:
+            self._copies_done.record()
+
     @staticmethod
     def stage(host: torch.Tensor, device: torch.Tensor, values: np.ndarray) -> None:
         count = values.shape[0]
@@ -158,6 +170,7 @@ class ModelRunner:
 
     def prepare_prefill(self, batch: Sequence[Request]) -> Tuple[torch.Tensor, BatchMetadata]:
         buffers = self.prefill_buffers
+        buffers.wait_for_prior_copies()
 
         input_ids: List[int] = []
         position_chunks: List[np.ndarray] = []
@@ -194,6 +207,7 @@ class ModelRunner:
             np.asarray(cumulative, dtype=np.int32),
         )
         width = self._gather_block_tables(batch, num_seqs, buffers)
+        buffers.mark_copies_enqueued()
 
         metadata = BatchMetadata(
             is_prefill=True,
@@ -215,6 +229,7 @@ class ModelRunner:
         self, batch: Sequence[Request], padded_size: Optional[int] = None
     ) -> Tuple[torch.Tensor, BatchMetadata]:
         buffers = self.decode_buffers
+        buffers.wait_for_prior_copies()
         num_seqs = len(batch)
         total = padded_size or num_seqs
 
@@ -236,6 +251,7 @@ class ModelRunner:
         buffers.stage(buffers.h_slot_mapping, buffers.slot_mapping, slots)
         buffers.stage(buffers.h_seq_lens, buffers.seq_lens, kv_lens)
         width = self._gather_block_tables(batch, total, buffers)
+        buffers.mark_copies_enqueued()
 
         metadata = BatchMetadata(
             is_prefill=False,
